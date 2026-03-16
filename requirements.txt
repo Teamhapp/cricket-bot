@@ -1,0 +1,6 @@
+httpx>=0.27
+google-genai>=1.0
+tweepy>=4.14
+apscheduler>=3.10,<4
+python-dotenv>=1.0
+Pillow>=10.0
