@@ -1,0 +1,6 @@
+run = "python bot.py"
+language = "python3"
+entrypoint = "bot.py"
+
+[deployment]
+run = ["python", "bot.py"]
