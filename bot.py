@@ -11,6 +11,7 @@ import logging
 import logging.handlers
 import os
 import re
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -515,7 +516,8 @@ async def generate_image(event: dict) -> bytes | None:
 
 
 async def upload_media(image_bytes: bytes) -> str | None:
-    """Upload image to Twitter via v1.1 API. Returns media_id string or None."""
+    """Upload image to Twitter. Tries v1.1 first, falls back to v2 endpoint."""
+    # Try v1.1 (tweepy.API) first — still works for many apps
     try:
         loop = asyncio.get_event_loop()
         media = await loop.run_in_executor(
@@ -525,10 +527,39 @@ async def upload_media(image_bytes: bytes) -> str | None:
                 file=io.BytesIO(image_bytes),
             ),
         )
-        logger.info("Media uploaded: %s", media.media_id_string)
+        logger.info("Media uploaded (v1.1): %s", media.media_id_string)
         return media.media_id_string
     except Exception as e:
-        logger.warning("Media upload failed: %s", e)
+        logger.warning("v1.1 media upload failed (%s), trying v2...", e)
+
+    # Fallback: v2 endpoint via httpx with OAuth1
+    try:
+        from requests_oauthlib import OAuth1
+
+        auth = OAuth1(
+            os.getenv("TWITTER_API_KEY"),
+            os.getenv("TWITTER_API_SECRET"),
+            os.getenv("TWITTER_ACCESS_TOKEN"),
+            os.getenv("TWITTER_ACCESS_TOKEN_SECRET"),
+        )
+        import requests
+
+        resp = requests.post(
+            "https://api.x.com/2/media/upload",
+            files={"media": ("cricket.png", io.BytesIO(image_bytes), "image/png")},
+            data={"media_category": "tweet_image"},
+            auth=auth,
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            media_id = resp.json().get("media_id_string", "")
+            if media_id:
+                logger.info("Media uploaded (v2): %s", media_id)
+                return media_id
+        logger.warning("v2 media upload returned %s: %s", resp.status_code, resp.text[:200])
+        return None
+    except Exception as e:
+        logger.warning("v2 media upload failed: %s", e)
         return None
 
 
@@ -572,15 +603,34 @@ async def generate_tweet(event: dict) -> str:
 # Post to X (Twitter)
 # ---------------------------------------------------------------------------
 
+# Daily tweet counter — free tier allows ~500 posts/month (~16/day)
+MAX_TWEETS_PER_DAY = int(os.getenv("MAX_TWEETS_PER_DAY", "15"))
+_tweet_count = 0
+_tweet_count_date = date.today()
 recent_tweets: set[str] = set()
+
+
+def _check_daily_limit() -> bool:
+    """Return True if we can still tweet today."""
+    global _tweet_count, _tweet_count_date
+    today = date.today()
+    if today != _tweet_count_date:
+        _tweet_count = 0
+        _tweet_count_date = today
+    return _tweet_count < MAX_TWEETS_PER_DAY
 
 
 async def post_tweet(text: str, image_bytes: bytes | None = None) -> bool:
     """Post a tweet to X, optionally with an image. Returns True on success."""
+    global _tweet_count
     if not text:
         return False
     if text in recent_tweets:
         logger.info("Skipping duplicate tweet")
+        return False
+    if not _check_daily_limit():
+        logger.warning("Daily tweet limit reached (%d/%d) — skipping",
+                        _tweet_count, MAX_TWEETS_PER_DAY)
         return False
 
     try:
@@ -600,10 +650,12 @@ async def post_tweet(text: str, image_bytes: bytes | None = None) -> bool:
             ),
         )
         recent_tweets.add(text)
+        _tweet_count += 1
         if len(recent_tweets) > 200:
             recent_tweets.clear()
-        logger.info("Tweet posted%s: %s",
-                     " with image" if media_ids else "", text[:80])
+        logger.info("Tweet posted%s (%d/%d today): %s",
+                     " with image" if media_ids else "",
+                     _tweet_count, MAX_TWEETS_PER_DAY, text[:80])
         return True
     except tweepy.TooManyRequests:
         logger.warning("Twitter rate limit hit — skipping")
