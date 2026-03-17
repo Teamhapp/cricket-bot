@@ -186,7 +186,7 @@ async def test_all():
         "detect_events", "generate_tweet", "generate_image",
         "upload_media", "post_tweet", "scrape_news",
         "match_monitor_job", "news_scraper_job", "main",
-        "get_gemini_client", "get_twitter_client", "get_twitter_api",
+        "get_gemini_client", "get_twitter_client", "get_twitter_oauth1",
         "save_state", "load_state",
     ]
     for fn in fns:

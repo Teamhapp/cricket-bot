@@ -5,6 +5,7 @@ generates journalist-style tweets with Gemini, and posts to X.
 """
 
 import asyncio
+import base64
 import io
 import json
 import logging
@@ -19,6 +20,8 @@ import tweepy
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
+from requests_oauthlib import OAuth1
+import requests as sync_requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ---------------------------------------------------------------------------
@@ -50,7 +53,6 @@ BROWSER_UA = (
 # Lazy-initialised clients (created on first use so missing keys don't crash import)
 _gemini_client = None
 _twitter_client = None
-_twitter_api = None
 
 
 def get_gemini_client() -> genai.Client:
@@ -75,18 +77,14 @@ def get_twitter_client() -> tweepy.Client:
     return _twitter_client
 
 
-def get_twitter_api() -> tweepy.API:
-    """v1.1 API needed for media uploads (v2 Client doesn't support them)."""
-    global _twitter_api
-    if _twitter_api is None:
-        auth = tweepy.OAuth1UserHandler(
-            consumer_key=os.getenv("TWITTER_API_KEY"),
-            consumer_secret=os.getenv("TWITTER_API_SECRET"),
-            access_token=os.getenv("TWITTER_ACCESS_TOKEN"),
-            access_token_secret=os.getenv("TWITTER_ACCESS_TOKEN_SECRET"),
-        )
-        _twitter_api = tweepy.API(auth)
-    return _twitter_api
+def get_twitter_oauth1() -> OAuth1:
+    """OAuth 1.0a signer for v2 media upload endpoint."""
+    return OAuth1(
+        os.getenv("TWITTER_API_KEY"),
+        os.getenv("TWITTER_API_SECRET"),
+        os.getenv("TWITTER_ACCESS_TOKEN"),
+        os.getenv("TWITTER_ACCESS_TOKEN_SECRET"),
+    )
 
 
 # In-memory state
@@ -516,51 +514,114 @@ async def generate_image(event: dict) -> bytes | None:
 
 
 async def upload_media(image_bytes: bytes) -> str | None:
-    """Upload image to Twitter. Tries v1.1 first, falls back to v2 endpoint."""
-    # Try v1.1 (tweepy.API) first — still works for many apps
+    """
+    Upload image to X using v2 media upload endpoint.
+    Tries simple upload first, falls back to chunked (INIT/APPEND/FINALIZE).
+    Uses OAuth 1.0a authentication as required by the media endpoint.
+    """
+    auth = get_twitter_oauth1()
+    loop = asyncio.get_event_loop()
+
+    # --- Attempt 1: Simple upload with base64 media_data ---
     try:
-        loop = asyncio.get_event_loop()
-        media = await loop.run_in_executor(
-            None,
-            lambda: get_twitter_api().media_upload(
-                filename="cricket.png",
-                file=io.BytesIO(image_bytes),
-            ),
-        )
-        logger.info("Media uploaded (v1.1): %s", media.media_id_string)
-        return media.media_id_string
-    except Exception as e:
-        logger.warning("v1.1 media upload failed (%s), trying v2...", e)
+        def _simple_upload():
+            return sync_requests.post(
+                "https://api.x.com/2/media/upload",
+                data={
+                    "media_data": base64.b64encode(image_bytes).decode(),
+                    "media_category": "tweet_image",
+                },
+                auth=auth,
+                timeout=30,
+            )
 
-    # Fallback: v2 endpoint via httpx with OAuth1
-    try:
-        from requests_oauthlib import OAuth1
+        resp = await loop.run_in_executor(None, _simple_upload)
 
-        auth = OAuth1(
-            os.getenv("TWITTER_API_KEY"),
-            os.getenv("TWITTER_API_SECRET"),
-            os.getenv("TWITTER_ACCESS_TOKEN"),
-            os.getenv("TWITTER_ACCESS_TOKEN_SECRET"),
-        )
-        import requests
-
-        resp = requests.post(
-            "https://api.x.com/2/media/upload",
-            files={"media": ("cricket.png", io.BytesIO(image_bytes), "image/png")},
-            data={"media_category": "tweet_image"},
-            auth=auth,
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            media_id = resp.json().get("media_id_string", "")
+        if resp.status_code in (200, 201, 202):
+            data = resp.json()
+            media_id = data.get("media_id_string", str(data.get("media_id", "")))
             if media_id:
-                logger.info("Media uploaded (v2): %s", media_id)
+                logger.info("Media uploaded (v2 simple): %s", media_id)
                 return media_id
-        logger.warning("v2 media upload returned %s: %s", resp.status_code, resp.text[:200])
-        return None
+
+        logger.warning("Simple upload returned %s: %s",
+                        resp.status_code, resp.text[:200])
     except Exception as e:
-        logger.warning("v2 media upload failed: %s", e)
-        return None
+        logger.warning("Simple upload failed (%s), trying chunked...", e)
+
+    # --- Attempt 2: Chunked upload (INIT → APPEND → FINALIZE) ---
+    try:
+        def _chunked_upload():
+            # INIT
+            init_resp = sync_requests.post(
+                "https://api.x.com/2/media/upload",
+                data={
+                    "command": "INIT",
+                    "media_type": "image/png",
+                    "total_bytes": str(len(image_bytes)),
+                    "media_category": "tweet_image",
+                },
+                auth=auth,
+                timeout=30,
+            )
+            if init_resp.status_code not in (200, 201, 202):
+                logger.warning("INIT failed %s: %s",
+                                init_resp.status_code, init_resp.text[:200])
+                return None
+
+            media_id = init_resp.json().get(
+                "media_id_string",
+                str(init_resp.json().get("media_id", ""))
+            )
+            if not media_id:
+                return None
+
+            # APPEND — send in 1MB chunks
+            chunk_size = 1_000_000
+            for i in range(0, len(image_bytes), chunk_size):
+                chunk = image_bytes[i : i + chunk_size]
+                seg_idx = i // chunk_size
+                append_resp = sync_requests.post(
+                    "https://api.x.com/2/media/upload",
+                    data={
+                        "command": "APPEND",
+                        "media_id": media_id,
+                        "segment_index": str(seg_idx),
+                    },
+                    files={"media": ("chunk", io.BytesIO(chunk), "application/octet-stream")},
+                    auth=auth,
+                    timeout=30,
+                )
+                if append_resp.status_code not in (200, 201, 202, 204):
+                    logger.warning("APPEND failed %s: %s",
+                                    append_resp.status_code, append_resp.text[:200])
+                    return None
+
+            # FINALIZE
+            fin_resp = sync_requests.post(
+                "https://api.x.com/2/media/upload",
+                data={
+                    "command": "FINALIZE",
+                    "media_id": media_id,
+                },
+                auth=auth,
+                timeout=30,
+            )
+            if fin_resp.status_code in (200, 201, 202):
+                logger.info("Media uploaded (v2 chunked): %s", media_id)
+                return media_id
+
+            logger.warning("FINALIZE failed %s: %s",
+                            fin_resp.status_code, fin_resp.text[:200])
+            return None
+
+        media_id = await loop.run_in_executor(None, _chunked_upload)
+        if media_id:
+            return media_id
+    except Exception as e:
+        logger.warning("Chunked upload failed: %s", e)
+
+    return None
 
 
 async def generate_tweet(event: dict) -> str:
